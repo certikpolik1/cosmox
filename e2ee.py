@@ -2,7 +2,6 @@ import os
 import secrets
 import base64
 import hashlib
-import json
 from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives import serialization, hashes
 from cryptography.hazmat.primitives.asymmetric import ed25519, x25519
@@ -11,6 +10,7 @@ from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 from cryptography.hazmat.primitives import padding as sym_padding
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.primitives.hmac import HMAC as HMAC_PRIMITIVE
+import json
 
 class E2EEChatProtocol:
     def __init__(self):
@@ -55,12 +55,18 @@ class E2EEChatProtocol:
 
         return ephemeral_public_key
 
-    def encrypt_message(self, message, recipient_public_key):
-        """Encrypts a message for the recipient with forward secrecy."""
+    def encrypt(self, content, metadata, recipient_public_key):
+        """Encrypts a message or file content with metadata for the recipient with forward secrecy."""
         ephemeral_public_key = self.rotate_session_keys(recipient_public_key)
 
         # Generate a nonce (IV) for GCM mode
         nonce = os.urandom(12)
+
+        # Prepare metadata for encryption
+        metadata_json = json.dumps(metadata).encode('utf-8')
+        
+        # Combine content and metadata into one byte stream (metadata first, followed by content)
+        combined_content = metadata_json + b"\n" + content
 
         # Create the cipher with the nonce
         cipher = Cipher(
@@ -71,15 +77,18 @@ class E2EEChatProtocol:
 
         encryptor = cipher.encryptor()
 
-        # Padding the message
-        padder = sym_padding.PKCS7(128).padder()
-        padded_message = padder.update(message.encode()) + padder.finalize()
+        # If the content is a string, apply padding for AES encryption
+        if isinstance(content, str):  # Treat it as text content if it's a string
+            padder = sym_padding.PKCS7(128).padder()
+            padded_content = padder.update(combined_content) + padder.finalize()
+        else:  # If it's binary data (like a file), we don't need padding
+            padded_content = combined_content
 
-        # Encrypt the padded message
-        ciphertext = encryptor.update(padded_message) + encryptor.finalize()
+        # Encrypt the padded content
+        ciphertext = encryptor.update(padded_content) + encryptor.finalize()
 
-        # Return serialized message with nonce, tag, and ciphertext in hex
-        encrypted_message = {
+        # Return serialized content with nonce, tag, and ciphertext in hex
+        encrypted_content = {
             'ephemeral_public_key': ephemeral_public_key.public_bytes(
                 encoding=serialization.Encoding.Raw,
                 format=serialization.PublicFormat.Raw
@@ -89,12 +98,12 @@ class E2EEChatProtocol:
             'tag': encryptor.tag.hex()  # Convert tag to hex
         }
 
-        return encrypted_message
+        return encrypted_content
 
-    def decrypt_message(self, encrypted_message, private_key):
-        """Decrypts a message and ensures message integrity and freshness."""
+    def decrypt(self, encrypted_content, private_key):
+        """Decrypts a message or file content along with metadata and ensures message integrity and freshness."""
         ephemeral_public_key = x25519.X25519PublicKey.from_public_bytes(
-            bytes.fromhex(encrypted_message['ephemeral_public_key'])
+            bytes.fromhex(encrypted_content['ephemeral_public_key'])
         )
         shared_key = private_key.exchange(ephemeral_public_key)
 
@@ -109,17 +118,28 @@ class E2EEChatProtocol:
         cipher = Cipher(
             algorithms.AES(derived_key),
             modes.GCM(
-                bytes.fromhex(encrypted_message['nonce']),
-                bytes.fromhex(encrypted_message['tag'])
+                bytes.fromhex(encrypted_content['nonce']),
+                bytes.fromhex(encrypted_content['tag'])
             ),
             backend=self.backend
         )
         decryptor = cipher.decryptor()
-        decrypted_padded_message = decryptor.update(bytes.fromhex(encrypted_message['ciphertext'])) + decryptor.finalize()
-        unpadder = sym_padding.PKCS7(128).unpadder()
-        decrypted_message = unpadder.update(decrypted_padded_message) + unpadder.finalize()
+        decrypted_padded_content = decryptor.update(bytes.fromhex(encrypted_content['ciphertext'])) + decryptor.finalize()
 
-        return decrypted_message.decode()
+        # Unpad the content if it's text (for file, we don't need unpadding)
+        try:
+            unpadder = sym_padding.PKCS7(128).unpadder()
+            decrypted_content = unpadder.update(decrypted_padded_content) + unpadder.finalize()
+
+            # Split the decrypted content back into metadata and actual content
+            metadata_json, file_content = decrypted_content.split(b"\n", 1)
+            metadata = json.loads(metadata_json.decode('utf-8'))
+            return metadata, file_content.decode()  # Return metadata and decrypted content as text
+        except ValueError:
+            # If unpadding fails, treat as binary file content
+            metadata_json, file_content = decrypted_padded_content.split(b"\n", 1)
+            metadata = json.loads(metadata_json.decode('utf-8'))
+            return metadata, file_content  # Return metadata and binary content
 
     def sign_message(self, message):
         """Signs a message with Ed25519 to ensure authenticity."""
@@ -206,4 +226,3 @@ class E2EEChatProtocol:
     def verify_ip_hash(self, message, ip_hash, ip_address):
         """Verifies the IP hash for the message."""
         return hashlib.sha256(ip_address.encode()).hexdigest() == ip_hash
-
