@@ -2,6 +2,7 @@ import os
 import secrets
 import base64
 import hashlib
+import time
 from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives import serialization, hashes
 from cryptography.hazmat.primitives.asymmetric import ed25519, x25519
@@ -25,19 +26,20 @@ class E2EEChatProtocol:
 
         self.current_session_keys = {}
 
+        # Store previously seen replay protection tokens
+        self.replay_protection_store = {}
+
     def generate_ephemeral_key_pair(self):
         private_key = x25519.X25519PrivateKey.generate()
         public_key = private_key.public_key()
         return private_key, public_key
 
     def rotate_session_keys(self, recipient_public_key):
-        # Convert bytes to X25519PublicKey
         recipient_public_key = x25519.X25519PublicKey.from_public_bytes(recipient_public_key)
         
         ephemeral_private_key, ephemeral_public_key = self.generate_ephemeral_key_pair()
         shared_key = ephemeral_private_key.exchange(recipient_public_key)
 
-        # Derive a new session key using HKDF for each message exchange
         derived_key = HKDF(
             algorithm=hashes.SHA256(),
             length=32,
@@ -46,7 +48,6 @@ class E2EEChatProtocol:
             backend=self.backend
         ).derive(shared_key)
 
-        # Store the keys for the current session
         self.current_session_keys = {
             'ephemeral_private_key': ephemeral_private_key,
             'ephemeral_public_key': ephemeral_public_key,
@@ -54,6 +55,49 @@ class E2EEChatProtocol:
         }
 
         return ephemeral_public_key
+
+    def generate_replay_protection_token(self, message, recipient_public_key):
+        """Generates a token to protect against message replay, using timestamp and nonce."""
+        timestamp = int(time.time())
+        nonce = secrets.token_bytes(16)  # Generate a 16-byte random nonce
+        message_hash = hashlib.sha256(message.encode()).hexdigest()
+
+        token = {
+            'message_hash': message_hash,
+            'timestamp': timestamp,
+            'nonce': nonce.hex()
+        }
+
+        recipient_key = recipient_public_key.public_bytes(
+            encoding=serialization.Encoding.Raw,
+            format=serialization.PublicFormat.Raw
+        ).hex()
+        
+        if recipient_key not in self.replay_protection_store:
+            self.replay_protection_store[recipient_key] = []
+
+        self.replay_protection_store[recipient_key].append(token)
+
+        return token
+
+    def verify_replay_protection_token(self, message, token, recipient_public_key):
+        """Verifies if a message has been replayed using the stored token data."""
+        recipient_key = recipient_public_key.public_bytes(
+            encoding=serialization.Encoding.Raw,
+            format=serialization.PublicFormat.Raw
+        ).hex()
+
+        stored_tokens = self.replay_protection_store.get(recipient_key, [])
+
+        message_hash = hashlib.sha256(message.encode()).hexdigest()
+
+        for stored_token in stored_tokens:
+            if stored_token['message_hash'] == message_hash and stored_token['nonce'] == token['nonce']:
+                # If we find the same message hash with the same nonce, this is a replay
+                return False
+
+        # If token is not found or the nonce is different, this message is new
+        return True
 
     def encrypt(self, content, metadata, recipient_public_key):
         """Encrypts a message or file content with metadata for the recipient with forward secrecy."""
@@ -87,7 +131,13 @@ class E2EEChatProtocol:
         # Encrypt the padded content
         ciphertext = encryptor.update(padded_content) + encryptor.finalize()
 
-        # Return serialized content with nonce, tag, and ciphertext in hex
+        # Generate the replay protection token
+        token = self.generate_replay_protection_token(content, recipient_public_key)
+
+        # Generate a real signature for the content
+        signature = self.sign_message(content)
+
+        # Return serialized content with nonce, tag, ciphertext in hex, replay protection token, and signature
         encrypted_content = {
             'ephemeral_public_key': ephemeral_public_key.public_bytes(
                 encoding=serialization.Encoding.Raw,
@@ -95,7 +145,9 @@ class E2EEChatProtocol:
             ).hex(),  # Convert ephemeral public key to hex
             'nonce': nonce.hex(),  # Convert nonce to hex
             'ciphertext': ciphertext.hex(),  # Convert ciphertext to hex
-            'tag': encryptor.tag.hex()  # Convert tag to hex
+            'tag': encryptor.tag.hex(),  # Convert tag to hex
+            'replay_token': token,  # Include the replay protection token
+            'signature': signature.hex()  # Include the signature
         }
 
         return encrypted_content
@@ -134,11 +186,33 @@ class E2EEChatProtocol:
             # Split the decrypted content back into metadata and actual content
             metadata_json, file_content = decrypted_content.split(b"\n", 1)
             metadata = json.loads(metadata_json.decode('utf-8'))
+            
+            # Verify the replay protection token
+            token = encrypted_content['replay_token']
+            if not self.verify_replay_protection_token(file_content.decode(), token, private_key.public_key()):
+                raise Exception("Replay detected. The message has been replayed.")
+
+            # Verify the signature
+            signature = bytes.fromhex(encrypted_content['signature'])
+            if not self.verify_signature(file_content.decode(), signature, self.ed25519_public_key):
+                raise Exception("Signature verification failed. The message may have been tampered with.")
+            
             return metadata, file_content.decode()  # Return metadata and decrypted content as text
         except ValueError:
             # If unpadding fails, treat as binary file content
             metadata_json, file_content = decrypted_padded_content.split(b"\n", 1)
             metadata = json.loads(metadata_json.decode('utf-8'))
+            
+            # Verify the replay protection token
+            token = encrypted_content['replay_token']
+            if not self.verify_replay_protection_token(file_content, token, private_key.public_key()):
+                raise Exception("Replay detected. The message has been replayed.")
+
+            # Verify the signature
+            signature = bytes.fromhex(encrypted_content['signature'])
+            if not self.verify_signature(file_content, signature, self.ed25519_public_key):
+                raise Exception("Signature verification failed. The message may have been tampered with.")
+            
             return metadata, file_content  # Return metadata and binary content
 
     def sign_message(self, message):
@@ -146,20 +220,12 @@ class E2EEChatProtocol:
         return self.ed25519_private_key.sign(message.encode())
 
     def verify_signature(self, message, signature, public_key):
-        """Verifies the authenticity of a message."""
+        """Verifies the authenticity of a message using Ed25519."""
         try:
             public_key.verify(signature, message.encode())
             return True
         except:
             return False
-
-    def generate_replay_protection_token(self, message):
-        """Generates a token to protect against message replay."""
-        return hashlib.sha256(message.encode()).digest()
-
-    def verify_replay_protection_token(self, message, token):
-        """Verifies if a message has been replayed."""
-        return hashlib.sha256(message.encode()).digest() == token
 
     def create_user_key_pair(self, password):
         """Generates a user-specific key pair based on a password."""
