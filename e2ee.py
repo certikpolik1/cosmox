@@ -20,7 +20,6 @@ class E2EEChatProtocol:
         self.ed25519_private_key = ed25519.Ed25519PrivateKey.generate()
         self.ed25519_public_key = self.ed25519_private_key.public_key()
 
-        
         self.x25519_private_key = x25519.X25519PrivateKey.generate()
         self.x25519_public_key = self.x25519_private_key.public_key()
 
@@ -32,7 +31,9 @@ class E2EEChatProtocol:
         return private_key, public_key
 
     def rotate_session_keys(self, recipient_public_key):
-
+        # Convert bytes to X25519PublicKey
+        recipient_public_key = x25519.X25519PublicKey.from_public_bytes(recipient_public_key)
+        
         ephemeral_private_key, ephemeral_public_key = self.generate_ephemeral_key_pair()
         shared_key = ephemeral_private_key.exchange(recipient_public_key)
 
@@ -58,33 +59,42 @@ class E2EEChatProtocol:
         """Encrypts a message for the recipient with forward secrecy."""
         ephemeral_public_key = self.rotate_session_keys(recipient_public_key)
 
+        # Generate a nonce (IV) for GCM mode
+        nonce = os.urandom(12)
+
+        # Create the cipher with the nonce
         cipher = Cipher(
             algorithms.AES(self.current_session_keys['derived_key']),
-            modes.GCM(os.urandom(12)),
+            modes.GCM(nonce),
             backend=self.backend
         )
+
         encryptor = cipher.encryptor()
+
+        # Padding the message
         padder = sym_padding.PKCS7(128).padder()
         padded_message = padder.update(message.encode()) + padder.finalize()
+
+        # Encrypt the padded message
         ciphertext = encryptor.update(padded_message) + encryptor.finalize()
 
-        # Return serialized message with nonce, tag, and ciphertext
+        # Return serialized message with nonce, tag, and ciphertext in hex
         encrypted_message = {
             'ephemeral_public_key': ephemeral_public_key.public_bytes(
                 encoding=serialization.Encoding.Raw,
                 format=serialization.PublicFormat.Raw
-            ),
-            'nonce': cipher.algorithm.mode.nonce,
-            'ciphertext': ciphertext,
-            'tag': encryptor.tag
+            ).hex(),  # Convert ephemeral public key to hex
+            'nonce': nonce.hex(),  # Convert nonce to hex
+            'ciphertext': ciphertext.hex(),  # Convert ciphertext to hex
+            'tag': encryptor.tag.hex()  # Convert tag to hex
         }
-        return json.dumps(encrypted_message)
+
+        return encrypted_message
 
     def decrypt_message(self, encrypted_message, private_key):
         """Decrypts a message and ensures message integrity and freshness."""
-        encrypted_message = json.loads(encrypted_message)
         ephemeral_public_key = x25519.X25519PublicKey.from_public_bytes(
-            encrypted_message['ephemeral_public_key']
+            bytes.fromhex(encrypted_message['ephemeral_public_key'])
         )
         shared_key = private_key.exchange(ephemeral_public_key)
 
@@ -99,13 +109,13 @@ class E2EEChatProtocol:
         cipher = Cipher(
             algorithms.AES(derived_key),
             modes.GCM(
-                encrypted_message['nonce'],
-                encrypted_message['tag']
+                bytes.fromhex(encrypted_message['nonce']),
+                bytes.fromhex(encrypted_message['tag'])
             ),
             backend=self.backend
         )
         decryptor = cipher.decryptor()
-        decrypted_padded_message = decryptor.update(encrypted_message['ciphertext']) + decryptor.finalize()
+        decrypted_padded_message = decryptor.update(bytes.fromhex(encrypted_message['ciphertext'])) + decryptor.finalize()
         unpadder = sym_padding.PKCS7(128).unpadder()
         decrypted_message = unpadder.update(decrypted_padded_message) + unpadder.finalize()
 
@@ -161,10 +171,10 @@ class E2EEChatProtocol:
         )
         ciphertext = encryptor.update(private_key_bytes) + encryptor.finalize()
         return {
-            'ciphertext': ciphertext,
-            'nonce': cipher.algorithm.mode.nonce,
-            'tag': encryptor.tag,
-            'salt': salt
+            'ciphertext': ciphertext.hex(),
+            'nonce': cipher.algorithm.mode.nonce.hex(),
+            'tag': encryptor.tag.hex(),
+            'salt': salt.hex()
         }
 
     def decrypt_user_private_key(self, encrypted_private_key, password, salt):
@@ -180,13 +190,13 @@ class E2EEChatProtocol:
         cipher = Cipher(
             algorithms.AES(key),
             modes.GCM(
-                encrypted_private_key['nonce'],
-                encrypted_private_key['tag']
+                bytes.fromhex(encrypted_private_key['nonce']),
+                bytes.fromhex(encrypted_private_key['tag'])
             ),
             backend=self.backend
         )
         decryptor = cipher.decryptor()
-        private_key_bytes = decryptor.update(encrypted_private_key['ciphertext']) + decryptor.finalize()
+        private_key_bytes = decryptor.update(bytes.fromhex(encrypted_private_key['ciphertext'])) + decryptor.finalize()
         return x25519.X25519PrivateKey.from_private_bytes(private_key_bytes)
 
     def hide_ip(self, message, ip_address):
@@ -196,3 +206,4 @@ class E2EEChatProtocol:
     def verify_ip_hash(self, message, ip_hash, ip_address):
         """Verifies the IP hash for the message."""
         return hashlib.sha256(ip_address.encode()).hexdigest() == ip_hash
+
