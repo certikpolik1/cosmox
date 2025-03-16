@@ -292,3 +292,34 @@ class E2EEChatProtocol:
     def verify_ip_hash(self, message, ip_hash, ip_address):
         """Verifies the IP hash for the message."""
         return hashlib.sha256(ip_address.encode()).hexdigest() == ip_hash
+
+    # Methods for socket integration
+    def initiate_key_exchange(self):
+        """Initiate key exchange and return the public key to be sent to the recipient."""
+        return self.x25519_public_key.public_bytes(
+            encoding=serialization.Encoding.Raw,
+            format=serialization.PublicFormat.Raw
+        )
+
+    def receive_key_exchange(self, recipient_public_key_bytes):
+        """Receive recipient's public key and rotate session keys."""
+        recipient_public_key = x25519.X25519PublicKey.from_public_bytes(recipient_public_key_bytes)
+        self.rotate_session_keys(recipient_public_key)
+
+    def prepare_message(self, message, metadata, recipient_public_key_bytes):
+        """Prepare an encrypted message for sending via socket."""
+        recipient_public_key = x25519.X25519PublicKey.from_public_bytes(recipient_public_key_bytes)
+        return self.encrypt(message, metadata, recipient_public_key)
+
+    def process_received_message(self, encrypted_content):
+        """Process a received encrypted message."""
+        return self.decrypt(encrypted_content, self.x25519_private_key)
+
+    def sign_for_authentication(self, message):
+        """Sign a message for authentication purposes."""
+        return self.sign_message(message)
+
+    def verify_authentication(self, message, signature, public_key_bytes):
+        """Verify the authenticity of a signed message."""
+        public_key = ed25519.Ed25519PublicKey.from_public_bytes(public_key_bytes)
+        return self.verify_signature(message, signature, public_key)
